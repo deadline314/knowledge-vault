@@ -10,6 +10,35 @@ import { SKIP_TAGS } from './readability';
 
 const BLOCK_LIMIT = 20_000; // 容錯：極端頁面的節點上限
 
+const NOISE_HINT =
+  /(?:^|[\s_-])(nav|navbar|navbox|menu|sidebar|breadcrumb|toc|pager|pagination|interlanguage|langlist|noprint|printfooter|catlinks|editsection|ambox|mbox|hatnote|skip|jump-link|share|sharing|sharebar|social-share|newsletter|subscribe|cookie|consent|advert|advertisement|promo|sponsored|masthead|sitenav)(?:[\s_-]|$)/i;
+const NOISE_ROLES = new Set(['navigation', 'banner', 'complementary', 'search', 'tablist', 'menubar']);
+
+function isNoise(el: Element): boolean {
+  if (!(el instanceof HTMLElement)) return false;
+  if (el.getAttribute('aria-hidden') === 'true') return true;
+  const role = (el.getAttribute('role') || '').toLowerCase();
+  if (NOISE_ROLES.has(role)) return true;
+  const cls = typeof el.className === 'string' ? el.className : '';
+  return NOISE_HINT.test(`${el.id} ${cls}`);
+}
+
+function isLinkList(el: Element): boolean {
+  const items = Array.from(el.children).filter((c) => c.tagName === 'LI');
+  if (items.length < 6) return false;
+  let linky = 0;
+  let counted = 0;
+  for (const li of items) {
+    const t = (li.textContent || '').trim();
+    if (!t) continue;
+    counted++;
+    const a = li.querySelector('a');
+    const at = (a?.textContent || '').trim();
+    if (a && at && at.length >= t.length - 2) linky++;
+  }
+  return counted > 0 && linky / counted > 0.8;
+}
+
 export function blockify(root: HTMLElement, baseUrl: string): ContentNode[] {
   const out: ContentNode[] = [];
   walk(root, out, baseUrl);
@@ -31,6 +60,7 @@ function handle(el: Element, out: ContentNode[], baseUrl: string): void {
   const tag = el.tagName;
   if (SKIP_TAGS.has(tag)) return;
   if (el instanceof HTMLElement && el.hidden) return;
+  if (isNoise(el)) return; // 導覽/側欄/分享列等子樹整段略過
 
   switch (tag) {
     case 'H1':
@@ -39,17 +69,18 @@ function handle(el: Element, out: ContentNode[], baseUrl: string): void {
     case 'H4':
     case 'H5':
     case 'H6': {
-      const text = clean(el.textContent);
+      const text = clean(textOf(el));
       if (text) out.push({ type: 'heading', level: Number(tag[1]), text });
       return;
     }
     case 'P': {
-      const text = clean(el.textContent);
+      const text = clean(textOf(el));
       if (text) out.push({ type: 'paragraph', text });
       return;
     }
     case 'UL':
     case 'OL': {
+      if (isLinkList(el)) return; // 純連結清單（語言切換 / 目錄 / 頁尾）視為導覽
       const node = listToNode(el, baseUrl);
       if (node.children && node.children.length) out.push(node);
       return;
@@ -66,7 +97,7 @@ function handle(el: Element, out: ContentNode[], baseUrl: string): void {
       return;
     }
     case 'BLOCKQUOTE': {
-      const text = clean(el.textContent);
+      const text = clean(textOf(el));
       if (text) out.push({ type: 'quote', text });
       return;
     }
@@ -90,7 +121,7 @@ function handle(el: Element, out: ContentNode[], baseUrl: string): void {
       if (el.children.length > 0) {
         walk(el, out, baseUrl);
       } else {
-        const text = clean(el.textContent);
+        const text = clean(textOf(el));
         if (text) out.push({ type: 'paragraph', text });
       }
     }
@@ -124,7 +155,7 @@ function tableToNode(el: Element): ContentNode | null {
   for (const tr of Array.from(trs)) {
     const cells = Array.from(tr.querySelectorAll('th,td')).map((c) => {
       const span = Number((c as HTMLTableCellElement).colSpan || 1);
-      const text = clean(c.textContent);
+      const text = clean(textOf(c));
       // 合併儲存格以重複值展開，維持欄位對齊
       return span > 1 ? Array(span).fill(text) : [text];
     });
@@ -145,7 +176,7 @@ function directText(li: Element): string {
   let s = '';
   for (const n of Array.from(li.childNodes)) {
     if (n.nodeType === Node.TEXT_NODE) s += n.textContent ?? '';
-    else if (n instanceof Element && n.tagName !== 'UL' && n.tagName !== 'OL') s += n.textContent ?? '';
+    else if (n instanceof Element && n.tagName !== 'UL' && n.tagName !== 'OL' && !SKIP_TAGS.has(n.tagName)) s += textOf(n);
   }
   return s;
 }
@@ -162,6 +193,14 @@ function absolutize(src: string, baseUrl: string): string {
   } catch {
     return src;
   }
+}
+
+/** 取元素可見文字：排除 style/script/noscript（避免內聯 CSS/JS 混入內文）。 */
+function textOf(el: Element): string {
+  if (!el.querySelector('style, script, noscript')) return el.textContent ?? '';
+  const clone = el.cloneNode(true) as Element;
+  clone.querySelectorAll('style, script, noscript').forEach((n) => n.remove());
+  return clone.textContent ?? '';
 }
 
 function clean(s: string | null | undefined): string {

@@ -8,7 +8,7 @@ import type { YtProbe } from '@/core/capture/youtube/captureYouTube';
 import type { ExportFormat } from '@/shared/settings';
 import type { SerializedError } from '@/shared/errors';
 
-export type Target = 'background' | 'content' | 'popup';
+export type Target = 'background' | 'content' | 'popup' | 'offscreen';
 
 /** 後端連動資料夾（AI Desktop linked-folders 的單項） */
 export interface LinkedFolder {
@@ -31,6 +31,8 @@ export interface ClipRequest {
   video?: { itag: number; label: string } | null;
   /** YouTube：是否下載字幕（覆寫設定預設；省略 = 用設定值） */
   subtitles?: boolean;
+  /** YouTube：指定要下載的字幕語言（依使用者在 popup 選的；省略 = 用設定偏好語言） */
+  subtitleLangs?: string[];
 }
 
 export type ClipPhase =
@@ -67,6 +69,9 @@ export interface BackgroundRequests {
   /** YouTube：給 popup 預先顯示畫質/字幕選項（不下載字幕） */
   'yt/probe': { payload: { tabId: number }; response: YtProbe };
 
+  /** 設定切換語言：背景套用語系並重建右鍵選單 */
+  'ui/applyLocale': { payload: { lang: string }; response: void };
+
   /** Drive OAuth */
   'drive/connect': { payload: void; response: { email: string | null } };
   'drive/status': {
@@ -91,6 +96,26 @@ export interface BackgroundRequests {
     payload: { baseUrl: string; name: string };
     response: LinkedFolder;
   };
+
+  /** 預覽頁：先擷取來源分頁內容（不儲存），給使用者勾選 */
+  'preview/capture': {
+    payload: { tabId: number; scope: CaptureScope };
+    response: CaptureResult;
+  };
+  /** 預覽頁：以使用者選取後（已過濾）的結果直接匯出＋儲存 */
+  'preview/save': {
+    payload: {
+      result: CaptureResult;
+      sourceTabId: number;
+      format: ExportFormat | 'subtitle';
+      tags?: string[];
+      project?: string | null;
+      video?: { itag: number; label: string } | null;
+      subtitles?: boolean;
+      subtitleLangs?: string[];
+    };
+    response: { id: string };
+  };
 }
 
 /** ---- content script 收的訊息 ---- */
@@ -102,6 +127,15 @@ export interface ContentRequests {
   'content/ping': { payload: void; response: 'pong' };
 }
 
+/** ---- offscreen document 收的訊息（重活：PDF 產生） ---- */
+export interface OffscreenRequests {
+  'offscreen/renderPdf': {
+    payload: { result: CaptureResult; baseName: string };
+    response: { base64: string };
+  };
+  'offscreen/ping': { payload: void; response: 'pong' };
+}
+
 /** ---- popup 收的廣播（fire-and-forget） ---- */
 export interface PopupBroadcasts {
   'clip/update': { payload: ClipSnapshot; response: void };
@@ -111,7 +145,9 @@ export type RequestMapOf<T extends Target> = T extends 'background'
   ? BackgroundRequests
   : T extends 'content'
     ? ContentRequests
-    : PopupBroadcasts;
+    : T extends 'offscreen'
+      ? OffscreenRequests
+      : PopupBroadcasts;
 
 /** 線上傳輸封包 */
 export interface Envelope {

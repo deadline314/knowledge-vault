@@ -1,0 +1,37 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="fur" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#925e32"/>
+      <stop offset="1" stop-color="#794c27"/>
+    </linearGradient>
+  </defs>
+  <!-- tile -->
+  <rect x="2" y="2" width="124" height="124" rx="29" fill="#f3ead8"/>
+  <!-- ears (behind head): shorter, rounder, tilted outward -->
+  <ellipse cx="43" cy="38" rx="13" ry="15" transform="rotate(-28 43 38)" fill="#5e3a1e"/>
+  <ellipse cx="85" cy="38" rx="13" ry="15" transform="rotate(28 85 38)" fill="#5e3a1e"/>
+  <ellipse cx="44" cy="38" rx="6.5" ry="8" transform="rotate(-28 44 38)" fill="#e7caa0"/>
+  <ellipse cx="84" cy="38" rx="6.5" ry="8" transform="rotate(28 84 38)" fill="#e7caa0"/>
+  <!-- head -->
+  <ellipse cx="64" cy="77" rx="42" ry="37" fill="url(#fur)"/>
+  <!-- cheeks/muzzle -->
+  <ellipse cx="64" cy="91" rx="24" ry="18" fill="#ecd3a8"/>
+  <!-- eyes -->
+  <circle cx="49" cy="74" r="7" fill="#2c1c10"/>
+  <circle cx="79" cy="74" r="7" fill="#2c1c10"/>
+  <circle cx="51.4" cy="71.6" r="2.4" fill="#fff" opacity="0.9"/>
+  <circle cx="81.4" cy="71.6" r="2.4" fill="#fff" opacity="0.9"/>
+  <!-- nose -->
+  <ellipse cx="64" cy="86" rx="5" ry="4" fill="#2c1c10"/>
+  <path d="M64 90 v4" stroke="#2c1c10" stroke-width="2" stroke-linecap="round"/>
+  <!-- teeth -->
+  <rect x="60.6" y="94" width="6.8" height="7" rx="2" fill="#fffaf0"/>
+  <path d="M64 94 v7" stroke="#d9c6a3" stroke-width="0.9"/>
+  <!-- acorn accent (top-right) -->
+  <g>
+    <rect x="98" y="11" width="4.2" height="8" rx="2.1" fill="#6b4321"/>
+    <path d="M82 31 q18 -19 36 0 q0 3.5 -3.5 3.5 H85.5 q-3.5 0 -3.5 -3.5 Z" fill="#6b4321"/>
+    <path d="M85.5 33 q14.5 21 29 0 q-2.5 19 -14.5 19 q-12 0 -14.5 -19 Z" fill="#d2933b"/>
+    <ellipse cx="95" cy="40" rx="2.8" ry="4" fill="#ecbd75" opacity="0.85"/>
+  </g>
+</svg>

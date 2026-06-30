@@ -37,6 +37,7 @@ Squirl 用**重用 Drive OAuth token** 的方式串接 AI Desktop——不需要
   "source_url": "https://...",        // 去重 / 回連
   "clipped_at": "2026-06-22T08:00:00Z",
   "calendar": { "mark": true, "duration_min": 5, "title_hint": "📎 Squirl 剪存：標題", "kind": "clip_marker" },
+  "transcribe": { "request": true, "reason": "captions_blocked", "langs": ["zh-Hant", "en"] },
   "attachments": [ { "file_id": "...", "role": "subtitle" }, { "file_id": "...", "role": "sidecar" } ]
 }
 ```
@@ -47,6 +48,7 @@ Squirl 用**重用 Drive OAuth token** 的方式串接 AI Desktop——不需要
 
 - 讀取 `source_type` / `source_url`（去重以 `source_url` 為鍵）。
 - `calendar.kind === "clip_marker"` 時建立一個 `duration_min` 分鐘的小事件（建議獨立行事曆 / 顏色，方便 filter「會議 / 請假 / 剪存」）。**建事件需獨立 try/catch——失敗不可影響 KB ingest。**
+- `transcribe.request === true` 時，從 `source_url` 伺服器端取音訊轉逐字稿併入 KB（`reason` 區分「字幕被鎖」或「使用者要逐字稿」，`langs` 為偏好語言）。**轉錄需獨立非同步處理——失敗或耗時不可阻擋 KB ingest。** 欄位缺省／舊後端忽略即可。
 - ingest 失敗時，資料夾同步（folder sync）需能自動補處理已落在 Drive 的檔案。
 
 ## 容錯保證（extension 端）

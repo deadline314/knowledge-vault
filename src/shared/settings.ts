@@ -99,7 +99,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     defaultFormat: 'md',
     pdfStrategy: 'auto',
     includeImages: true,
-    writeSidecar: true,
+    writeSidecar: false,
   },
   drive: {
     authEnabled: false,

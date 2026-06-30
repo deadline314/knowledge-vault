@@ -144,6 +144,19 @@ export interface CalendarMarker {
   kind: 'clip_marker';
 }
 
+/**
+ * 轉錄請求（後端在伺服器端從 source_url 取音訊轉逐字稿，再併入 KB）。
+ * 設計理由：YouTube 近期常鎖字幕下載；與其在擴充內塞重量級 Whisper，
+ * 不如把「轉錄」交給後端——後端本就能用 source_url 取得內容，且結果可直接索引。
+ * - reason='captions_blocked'：要字幕但抓不到 → 後端補轉錄。
+ * - reason='user_requested'：使用者下載了影片要逐字稿。
+ */
+export interface TranscribeRequest {
+  request: boolean;
+  reason: 'captions_blocked' | 'user_requested';
+  langs: string[];
+}
+
 export interface IngestParams {
   fileId: string;
   fileName: string;
@@ -154,6 +167,7 @@ export interface IngestParams {
   clippedAt: string; // UTC ISO
   calendar?: CalendarMarker;
   attachments?: { fileId: string; role: 'subtitle' | 'sidecar' }[];
+  transcribe?: TranscribeRequest;
 }
 
 export interface IngestOutcome {
@@ -191,6 +205,13 @@ export async function notifyIngest(
               duration_min: params.calendar.durationMin,
               title_hint: params.calendar.titleHint,
               kind: params.calendar.kind,
+            }
+          : null,
+        transcribe: params.transcribe
+          ? {
+              request: params.transcribe.request,
+              reason: params.transcribe.reason,
+              langs: params.transcribe.langs,
             }
           : null,
         attachments: (params.attachments ?? []).map((a) => ({ file_id: a.fileId, role: a.role })),

@@ -10,6 +10,7 @@ import type {
   BackgroundRequests,
   ContentRequests,
   Envelope,
+  OffscreenRequests,
   PopupBroadcasts,
   RequestMapOf,
   Target,
@@ -79,6 +80,28 @@ export function sendToContent<K extends keyof ContentRequests>(
     }),
     timeoutMs,
     `content/${String(type)}`,
+  );
+}
+
+/** 送訊息到 offscreen document（runtime.sendMessage；由 background 呼叫） */
+export function sendToOffscreen<K extends keyof OffscreenRequests>(
+  type: K,
+  payload: OffscreenRequests[K]['payload'],
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<OffscreenRequests[K]['response']> {
+  const env: Envelope = { __squirl: true, target: 'offscreen', type: String(type), payload };
+  return withTimeout(
+    new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(env, (res: WireResponse | undefined) => {
+        const err = chrome.runtime.lastError;
+        if (err) return reject(new AppError('NO_RESPONSE', err.message ?? 'offscreen not reachable'));
+        if (!res) return reject(new AppError('NO_RESPONSE', 'empty response'));
+        if (!res.ok) return reject(rebuild(res.error));
+        resolve(res.data as OffscreenRequests[K]['response']);
+      });
+    }),
+    timeoutMs,
+    `offscreen/${String(type)}`,
   );
 }
 

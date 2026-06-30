@@ -46,7 +46,7 @@
 | UI（設定／彈窗） | **Svelte 5** + TypeScript | runtime 極小、編譯期響應式 |
 | 內容擷取執行環境 | **Content Script**（注入目標分頁） | 唯一能讀「JS 動態渲染後 live DOM」的環境 |
 | 協調 / 權限 / 網路 | **Background Service Worker** | context menu、Drive OAuth、跨網域 fetch、通知 |
-| PDF 產生 | 目標分頁內 `chrome.tabs` 列印 → PDF（背景 `chrome.debugger`/`Page.printToPDF`）或可插拔 `jsPDF`/`pdf-lib` | 見 §7.4，採可抽換策略，預設用最省記憶體的路徑 |
+| PDF 產生 | **Offscreen document** + `pdf-lib` + 內嵌中文字型（subset） | 見 §7.4；pdf-lib 太重不能放 SW，offscreen 按需建立 |
 | 雲端儲存 | Google Drive **resumable upload** + `chrome.identity` | 直接沿用 Capyture 的 `DriveClient`／`DriveAuth` |
 | 機密存放 | WebCrypto AES-GCM（`shared/secrets.ts`） | 沿用 Capyture，client ID 不以明文落地 |
 | 設定持久化 | `chrome.storage.local` + schema 版本化 + 預設值合併 | 沿用 Capyture `settings.ts` 模式 |
@@ -287,14 +287,13 @@ Daniel 的原則：**第一版越無腦越好，進階藏起來**。對應到選
 - **為何延後**：YouTube 走 DASH，畫面與聲音是**分離串流**，下載需解析 `player response`、處理可能的簽章/節流參數、再用 `mux`（如 ffmpeg.wasm）把音訊與視訊合併——記憶體與複雜度高，且涉 ToS 風險。先讓 v1 用「URL + 字幕」順手上線（Daniel 節奏）。
 - v2 落地時，畫質／檔案大小選單直接讀 `video[]`；合併走可選的 `ffmpeg.wasm`（lazy-load，僅在使用者要下載影片時才載入，平時零記憶體成本）。
 
-### 7.4 PDF 匯出策略（可抽換）
-PDF 在擴充功能裡有多條路，各有取捨，故抽成策略：
-| 策略 | 方式 | 取捨 |
-|------|------|------|
-| A（預設）| `chrome.debugger` attach 目標分頁 → `Page.printToPDF` | 最忠實（瀏覽器原生排版）、記憶體低；需 `debugger` 權限，attach 時分頁頂端有提示列 |
-| B（後備）| 由 `ContentTree` 用 `pdf-lib` 自行排版 | 不需額外權限、輸出乾淨（去廣告）；複雜排版還原度較低 |
-| C（最簡）| 產生乾淨 HTML → 開隱藏分頁觸發列印對話框 | 需使用者互動，最不順手 |
-- 預設 A，失敗自動退 B。策略選擇收在設定頁進階區。
+### 7.4 PDF 匯出（offscreen + 內嵌中文字型）
+PDF 由 `ContentTree` 用 `pdf-lib` 自行排版，**在 offscreen document 執行**（不在 service worker）：
+- **為何放 offscreen**：pdf-lib 體積大、需要完整 document 環境；放進 service worker 會讓 SW 過大而**註冊失敗**（status 15）。offscreen 只在要產 PDF 時由 background 建立（`chrome.offscreen.createDocument`，reason `BLOBS`），用完保留以重用字型快取。
+- **中文支援**：bundle 一份 `NotoSansCJK-subset.ttf`（Latin + 常用漢字 + 注音 + 全形/標點），`embedFont(bytes, { subset: true })` 只嵌入實際用到的字 → 中文正常顯示、檔案不致過大。
+- **換行**：CJK 逐字可斷、英文單字不切斷（見 `core/export/pdfRender.ts` 的 `tokenize`/`wrap`）。
+- **流程**：`ClipOrchestrator.#exportAll` 偵測 `format==='pdf'` → `renderPdfViaOffscreen()`（`core/export/offscreenPdf.ts` 負責 offscreen 生命週期 + base64 傳遞）→ 失敗自動退 Markdown 保底（保證「至少存得到」）。
+- **不再使用 `chrome.debugger`**（Chrome 對其 optional 化有警告，且 attach 會在分頁頂端顯示提示列）。
 
 ### 7.5 Sidecar：`squirl/clip-meta@1`
 每次剪存附一個 `.meta.json`，作為 AI Desktop 的結構化交接：
@@ -343,12 +342,19 @@ POST /api/extension/ingest
     "title_hint": "📎 Squirl 剪存：標題",
     "kind": "clip_marker"
   },
+  "transcribe": {                      // 新增（可選）：請後端從 source_url 伺服器端轉錄逐字稿
+    "request": true,
+    "reason": "captions_blocked",      // captions_blocked（要字幕但抓不到）| user_requested（使用者下載了影片）
+    "langs": ["zh-Hant", "en"]         // 偏好語言（轉錄/翻譯參考）
+  },
   "attachments": [                     // 可選：字幕/sidecar 也已上傳同資料夾
     { "file_id": "...", "role": "subtitle" }
   ]
 }
 ```
 回應沿用 `IngestOutcome { status: 'queued'|'duplicate', kb_name, event_id, matched }`。
+
+**transcribe 觸發條件**（擴充端 `ClipOrchestrator.#planTranscription`）：來源是 YouTube、使用者要內容（勾字幕或下載影片）、且擴充端**沒能取到字幕純文字**時才送。字幕已成功取得就不重複轉錄。後端用 `source_url` 取音訊轉逐字稿併入 KB；欄位缺省或舊後端忽略不影響既有流程。
 
 ### 8.3 處理流程（高容錯，明確分段）
 ```
@@ -399,7 +405,7 @@ POST /api/extension/ingest
 | 選取範圍跨多容器 | range 解析 | 退回擷取整頁，warning 提示 |
 | YouTube 無字幕 | captions 空 | 存 URL + metadata，warning 提示 |
 | YouTube 版面改版 | player response 解析失敗 | 退回只存 URL + 頁面可見 metadata |
-| PDF 策略 A 失敗 | `Page.printToPDF` reject | 自動退策略 B（pdf-lib），再失敗退 MD |
+| PDF 產生失敗 | offscreen `renderPdf` reject／字型載入失敗 | 自動退 Markdown（保證落地），記 log |
 | Drive 未設定／未連線 | DriveAuth mode==='none' | 退本機下載，提示「去設定連線 Drive」 |
 | Drive 上傳中斷 | 5xx／斷網 | resumable 查 offset 斷點續傳，指數退避 max 5；最終失敗退本機留存 |
 | OAuth token 過期 | 401 | 靜默刷新一次；失敗才跳互動 |
@@ -425,13 +431,13 @@ permissions: [
   "storage",          // 設定
   "identity",         // Drive OAuth
   "identity.email",   // 顯示帳號
-  "notifications"     // 結果通知
+  "notifications",    // 結果通知
+  "offscreen"         // PDF 產生（pdf-lib + 內嵌中文字型，太重不能放 SW）
 ],
-optional_permissions: [ "debugger" ],            // PDF 策略 A，按需請求
 optional_host_permissions: [ "https://*/*", "http://*/*" ],  // AI Desktop 後端網址，連線時才請求
 host_permissions: [ ]                            // 內容擷取走 activeTab + scripting，不需常駐全網域
 ```
-原則：**最小權限**。Drive scope 只用 `drive.file`（僅能存取自己建立的檔案）。`debugger`、AI Desktop host 都延後到使用者啟用時才請求。
+原則：**最小權限**。Drive scope 只用 `drive.file`（僅能存取自己建立的檔案）。AI Desktop host 延後到使用者啟用時才請求。`offscreen` 為靜態權限（產 PDF 必需），但 offscreen document 僅在實際要產 PDF 時才建立。
 
 ---
 

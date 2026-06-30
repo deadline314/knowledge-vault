@@ -14,16 +14,18 @@ import { AppError, serializeError } from '@/shared/errors';
 import { createLogger } from '@/shared/logger';
 import { sendToContent } from '@/messaging/bus';
 import type { ClipRequest, ClipSnapshot } from '@/messaging/protocol';
-import type { CaptureResult } from '@/core/capture/ContentSource';
+import type { CaptureResult, ContentNode } from '@/core/capture/ContentSource';
+import { t, setLocale, errorMessage } from '@/shared/i18n';
 import { captureYouTube, isYouTubeUrl } from '@/core/capture/youtube/captureYouTube';
 import { ExporterRegistry } from '@/core/export/ExporterRegistry';
 import { safeFileName, timestamp, type ExportArtifact } from '@/core/export/Exporter';
+import { renderPdfViaOffscreen } from '@/core/export/offscreenPdf';
 import { buildSidecar } from '@/core/export/sidecar';
 import { DriveTarget } from '@/core/storage/DriveTarget';
 import { LocalDownloadTarget } from '@/core/storage/LocalDownloadTarget';
 import type { StorageTarget, StoredRef } from '@/core/storage/StorageTarget';
 import { DriveAuth } from '@/core/auth/DriveAuth';
-import { notifyIngest, type ClipSourceType } from '@/core/aidesktop/AiDesktopClient';
+import { notifyIngest, type ClipSourceType, type TranscribeRequest } from '@/core/aidesktop/AiDesktopClient';
 import {
   isTerminal,
   newSnapshot,
@@ -33,7 +35,7 @@ import {
 } from './ClipJob';
 
 const log = createLogger('orchestrator');
-const VERSION = '0.1.2';
+const VERSION = '1.0.3';
 
 export interface OrchestratorDeps {
   emit: (s: ClipSnapshot) => void;
@@ -69,8 +71,30 @@ export class ClipOrchestrator {
     return id;
   }
 
-  async #execute(id: string, req: ClipRequest): Promise<void> {
+  /** 擷取目前分頁內容（給預覽頁先取得內容樹；不儲存）。 */
+  async capture(req: ClipRequest): Promise<CaptureResult> {
+    return this.#capture(req, await loadSettings());
+  }
+
+  /**
+   * 用「已擷取（且可能已由使用者在預覽頁過濾選取）」的結果直接匯出＋儲存。
+   * 不重新擷取，避免頁面已變動或重複成本；其餘流程（匯出／儲存／通知／影片）與 run() 共用。
+   */
+  async runWithResult(req: ClipRequest, result: CaptureResult): Promise<string> {
+    const id = crypto.randomUUID();
+    const lockKey = `preview:${req.tabId}:${req.format ?? 'default'}`;
+    if (this.#locks.has(lockKey)) {
+      log.info('duplicate preview save ignored', lockKey);
+      return id;
+    }
+    this.#locks.add(lockKey);
+    void this.#execute(id, req, async () => result).finally(() => this.#locks.delete(lockKey));
+    return id;
+  }
+
+  async #execute(id: string, req: ClipRequest, provideResult?: (s: AppSettings) => Promise<CaptureResult>): Promise<void> {
     const settings = await loadSettings();
+    setLocale(settings.ui.language || 'auto');
     let snap = newSnapshot(id, '', '');
     const publish = (entry: HistoryEntry) => {
       this.deps.emit(entry.snapshot);
@@ -88,10 +112,16 @@ export class ClipOrchestrator {
     };
 
     try {
-      // 1. 擷取
-      const isYt = req.scope === 'page' && (await this.#isYouTube(req.tabId));
-      update({ phase: 'capturing', detail: isYt ? '讀取 YouTube 播放器資料與字幕…' : '擷取頁面內容…' });
-      const result = await this.#capture(req, settings);
+      // 1. 擷取（預覽存檔時 provideResult 直接給現成、已選取的結果，不重新擷取）
+      let result: CaptureResult;
+      if (provideResult) {
+        update({ phase: 'capturing', detail: '套用已選取的內容…' });
+        result = await provideResult(settings);
+      } else {
+        const isYt = req.scope === 'page' && (await this.#isYouTube(req.tabId));
+        update({ phase: 'capturing', detail: isYt ? '讀取 YouTube 播放器資料與字幕…' : '擷取頁面內容…' });
+        result = await this.#capture(req, settings);
+      }
       snap = patchSnapshot(snap, { title: result.title, url: result.url });
 
       // 2. 匯出
@@ -111,9 +141,17 @@ export class ClipOrchestrator {
 
       // 4. 通知 AI Desktop（best-effort，僅真的存進 Drive 時）
       let duplicate = false;
+      let transcribeRequested = false;
       if (settings.aiDesktop.enabled && target.id === 'drive') {
-        update({ phase: 'notifying', detail: `通知 AI Desktop 排入知識庫「${settings.aiDesktop.kbName || '…'}」` });
-        duplicate = await this.#ingest(result, format, primary, primaryRef, attachmentRefs, settings);
+        const transcribe = this.#planTranscription(result, req, settings);
+        transcribeRequested = !!transcribe;
+        update({
+          phase: 'notifying',
+          detail: transcribe
+            ? '通知 AI Desktop 排入知識庫並轉錄逐字稿…'
+            : `通知 AI Desktop 排入知識庫「${settings.aiDesktop.kbName || '…'}」`,
+        });
+        duplicate = await this.#ingest(result, format, primary, primaryRef, attachmentRefs, settings, transcribe);
       }
 
       // 5. 影片下載（YouTube + 選了畫質）——放最後，全程顯示真實進度
@@ -126,23 +164,26 @@ export class ClipOrchestrator {
       }
 
       // 6. 完成
-      const savedMsg = fellBackToLocal
-        ? '上傳 Drive 失敗，已改存本機。'
-        : target.id === 'drive'
-          ? '已存到 Drive。'
-          : '已存到本機。';
-      update({ phase: 'done', webViewLink: primaryRef.webViewLink, duplicate, detail: videoFile ? `${savedMsg} 影片：${videoFile}` : savedMsg });
+      const savedMsg = fellBackToLocal ? t('done_fellback') : target.id === 'drive' ? t('done_drive') : t('done_local');
+      const transcribeNote = transcribeRequested ? ' ' + t('done_transcribe') : '';
+      const detail = `${savedMsg}${videoFile ? ' ' + t('done_video', videoFile) : ''}${transcribeNote}`;
+      update({ phase: 'done', webViewLink: primaryRef.webViewLink, duplicate, detail });
       this.deps.notify(
         duplicate
-          ? { kind: 'duplicate', title: result.title, message: '這個網址已剪存過。', webViewLink: primaryRef.webViewLink }
-          : { kind: 'saved', title: result.title, message: savedMsg + (videoFile ? ' 影片已下載。' : ''), webViewLink: primaryRef.webViewLink },
+          ? { kind: 'duplicate', title: result.title, message: t('notify_dupMsg'), webViewLink: primaryRef.webViewLink }
+          : {
+              kind: 'saved',
+              title: result.title,
+              message: savedMsg + (videoFile ? ' ' + t('done_videoDl') : '') + transcribeNote,
+              webViewLink: primaryRef.webViewLink,
+            },
       );
     } catch (e) {
       const error = serializeError(e);
       log.warn('clip failed', error);
       snap = patchSnapshot(snap, { phase: 'error', error });
       publish({ snapshot: snap, request: req });
-      this.deps.notify({ kind: 'failed', title: snap.title || '剪存', message: messageOf(error.code) });
+      this.deps.notify({ kind: 'failed', title: snap.title || 'Squirl', message: errorMessage(error.code) });
     }
   }
 
@@ -157,7 +198,7 @@ export class ClipOrchestrator {
         try {
           return await captureYouTube(req.tabId, url, {
             saveSubtitles: req.subtitles ?? s.youtube.saveSubtitles,
-            preferredLangs: s.youtube.preferredLangs,
+            preferredLangs: req.subtitleLangs && req.subtitleLangs.length ? req.subtitleLangs : s.youtube.preferredLangs,
           });
         } catch (e) {
           log.warn('YouTube MAIN-world capture failed; falling back to content script', e);
@@ -257,7 +298,11 @@ export class ClipOrchestrator {
     };
 
     const requested: ExportFormat | 'subtitle' = req.format ?? s.export.defaultFormat;
+    let format: string = requested; // 實際產出的格式（PDF 退回時會變 md）
     const attachments: ExportArtifact[] = [];
+
+    // 影片字幕直接融入主檔（md/txt/pdf）——不另存獨立字幕檔；'subtitle' 格式才輸出字幕本身
+    const exportResult = this.#embedCaptions(result, requested);
 
     // 主檔
     let primary: ExportArtifact;
@@ -268,24 +313,35 @@ export class ClipOrchestrator {
       if (!subs.length) throw new AppError('YT_NO_CAPTIONS', 'no captions to export');
       primary = { ...subs[0]!, role: 'primary' };
       attachments.push(...subs.slice(1));
+    } else if (requested === 'pdf') {
+      // PDF 在 offscreen 產生（內嵌中文字型）；失敗則退回 Markdown 保證落地
+      try {
+        const bytes = await renderPdfViaOffscreen(exportResult, baseName);
+        primary = {
+          blob: new Blob([bytes.buffer as ArrayBuffer], { type: 'application/pdf' }),
+          fileName: `${baseName}.pdf`,
+          mimeType: 'application/pdf',
+          role: 'primary',
+        };
+      } catch (e) {
+        log.warn('PDF 產生失敗，改用 Markdown 保底', serializeError(e));
+        const exp = this.#exporters.resolvePrimary('md', exportResult);
+        const arts = await exp.export(exportResult, opts);
+        if (!arts.length) throw new AppError('EXPORT_FAILED', 'pdf fallback produced no output');
+        primary = arts[0]!;
+        attachments.push(...arts.slice(1));
+        format = 'md';
+      }
     } else {
-      // md / txt（pdf 暫時退回 md：見 ExporterRegistry.resolvePrimary）
-      const exp = this.#exporters.resolvePrimary(requested, result);
-      const arts = await exp.export(result, opts);
+      // md / txt
+      const exp = this.#exporters.resolvePrimary(requested, exportResult);
+      const arts = await exp.export(exportResult, opts);
       if (!arts.length) throw new AppError('EXPORT_FAILED', 'exporter produced no output');
       primary = arts[0]!;
       attachments.push(...arts.slice(1));
     }
 
-    // YouTube 字幕作為附件（非主檔時）
-    if (result.kind === 'youtube' && (req.subtitles ?? s.youtube.saveSubtitles) && requested !== 'subtitle') {
-      try {
-        const subExp = this.#exporters.subtitle()!;
-        if (subExp.supports(result)) attachments.push(...(await subExp.export(result, opts)));
-      } catch (e) {
-        log.warn('subtitle export failed (non-fatal)', e);
-      }
-    }
+    // 註：影片字幕已融入主檔（見 #embedCaptions），不再另存獨立字幕檔（'subtitle' 格式除外）。
 
     // sidecar
     if (s.export.writeSidecar) {
@@ -297,7 +353,7 @@ export class ClipOrchestrator {
             primaryFileName: primary.fileName,
             subtitleFileNames: subtitleNames,
             sidecarFileName: `${baseName}.meta.json`,
-            format: requested,
+            format,
             tags: req.tags ?? [],
             project: req.project ?? null,
             version: VERSION,
@@ -309,7 +365,25 @@ export class ClipOrchestrator {
       }
     }
 
-    return { primary, attachments, format: requested };
+    return { primary, attachments, format };
+  }
+
+  /**
+   * 影片字幕融入主檔：把可取得的字幕逐字稿接成內容樹的一個章節，
+   * 讓 md/txt/pdf 各匯出器自然包含（單一處理點、各格式共用、好維護）。
+   * 沒有字幕或為 'subtitle' 格式時原樣返回，不動到原結果。
+   */
+  #embedCaptions(result: CaptureResult, requested: string): CaptureResult {
+    if (result.kind !== 'youtube' || requested === 'subtitle') return result;
+    const caps = (result.youtube?.captions ?? []).filter((c) => !!c.text && c.text.trim().length > 0);
+    if (!caps.length) return result;
+    const children: ContentNode[] = [];
+    for (const c of caps) {
+      const title = `${c.name} (${c.lang})${c.auto ? ` · ${t('captionsAuto')}` : ''}`;
+      children.push({ type: 'section', level: 3, text: title, children: [{ type: 'paragraph', text: c.text!.trim() }] });
+    }
+    const section: ContentNode = { type: 'section', level: 2, text: t('captionsHeading'), children };
+    return { ...result, tree: [...result.tree, section] };
   }
 
   async #pickTarget(s: AppSettings): Promise<{ target: StorageTarget; ctx: { folderId?: string; folderPath?: string[] } }> {
@@ -369,7 +443,24 @@ export class ClipOrchestrator {
     return refs;
   }
 
-  /** 通知後端排入 KB（+ 行事曆標記）。回傳是否為重複。 */
+  /**
+   * 決定是否請後端轉錄逐字稿。規則：YouTube 影片 + 使用者要內容（字幕或影片）
+   * + 我們沒能取得字幕純文字 → 請後端從 source_url 伺服器端轉錄。
+   * 字幕已成功取得時不重複轉錄；非 YouTube 不轉錄。回 undefined = 不需轉錄。
+   */
+  #planTranscription(result: CaptureResult, req: ClipRequest, s: AppSettings): TranscribeRequest | undefined {
+    if (result.kind !== 'youtube') return undefined;
+    const captionTextSaved = (result.youtube?.captions ?? []).some((c) => !!c.text && c.text.trim().length > 0);
+    const wantsContent = (req.subtitles ?? s.youtube.saveSubtitles) || req.video != null;
+    if (!wantsContent || captionTextSaved) return undefined;
+    return {
+      request: true,
+      reason: req.video != null ? 'user_requested' : 'captions_blocked',
+      langs: s.youtube.preferredLangs,
+    };
+  }
+
+  /** 通知後端排入 KB（+ 行事曆標記 + 可選轉錄）。回傳是否為重複。 */
   async #ingest(
     result: CaptureResult,
     format: string,
@@ -377,6 +468,7 @@ export class ClipOrchestrator {
     primaryRef: StoredRef,
     attachmentRefs: { ref: StoredRef; role: 'subtitle' | 'sidecar' }[],
     s: AppSettings,
+    transcribe?: TranscribeRequest,
   ): Promise<boolean> {
     let token: string;
     try {
@@ -402,6 +494,7 @@ export class ClipOrchestrator {
             kind: 'clip_marker',
           }
         : undefined,
+      transcribe,
       attachments: attachmentRefs.map((a) => ({ fileId: a.ref.id, role: a.role })),
     });
     return outcome?.status === 'duplicate';

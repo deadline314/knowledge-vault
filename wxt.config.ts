@@ -19,9 +19,9 @@ export default defineConfig({
       'identity', // Drive OAuth
       'identity.email', // 顯示帳號
       'notifications', // 結果通知
+      'offscreen', // PDF 產生（pdf-lib + 內嵌中文字型，太重不能放 SW）
     ],
-    // 註：'debugger' 無法作為 optional permission（Chrome 會忽略並警告），且 PDF 暫時移除，
-    // 故這裡不再宣告 optional_permissions。
+    // 註：'debugger' 無法作為 optional permission（Chrome 會忽略並警告），故不宣告 optional_permissions。
     // AI Desktop 後端網址由使用者在設定頁填入，build 時不可知——
     // 採 optional host permission，按「連線」時才針對該網址請求一次。
     // http 放行以支援 localhost／區網 IP 開發測試。
